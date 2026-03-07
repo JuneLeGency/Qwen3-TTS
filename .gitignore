@@ -22,3 +22,8 @@ wheels/
 .vscode/
 venv/
 env/
+# Tinker local
+.env
+Qwen3-TTS-*/
+api_server.py.bak
+
