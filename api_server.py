@@ -5,10 +5,12 @@ Models at startup: CustomVoice (0.6B) + Base (0.6B) — always loaded.
 VoiceDesign (1.7B) — lazy-loaded on first use to save VRAM.
 
 All endpoints support automatic text chunking for long texts.
+Streaming mode (stream=true) returns NDJSON chunks as they're generated.
 """
 
 import base64
 import io
+import json
 import logging
 import os
 import re
@@ -24,6 +26,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 from qwen_tts import Qwen3TTSModel
 
@@ -113,6 +116,55 @@ def encode_audio(wav: np.ndarray, sr: int, fmt: str = "wav") -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
+def _stream_chunks_response(chunks: list[str], generate_fn, fmt: str = "wav"):
+    """Return a StreamingResponse that yields NDJSON lines as each chunk is synthesized.
+
+    Args:
+        chunks: List of text chunks to synthesize.
+        generate_fn: Callable(chunk_text) -> (wavs, sample_rate). Called per chunk.
+        fmt: Audio format (wav or mp3).
+
+    Yields NDJSON lines:
+        {"event": "chunk", "index": i, "total": N, "audio_base64": "...", "sample_rate": SR, "duration_seconds": D}
+        ...
+        {"event": "done", "total_chunks": N, "total_duration_seconds": T, "sample_rate": SR}
+    """
+    total = len(chunks)
+
+    def _generate():
+        total_duration = 0.0
+        last_sr = 24000  # fallback
+
+        for i, chunk in enumerate(chunks):
+            logger.info("  [stream] Chunk %d/%d (%d chars): %s...",
+                        i + 1, total, len(chunk), chunk[:40])
+            wavs, sr = generate_fn(chunk)
+            last_sr = sr
+            wav = wavs[0]
+            duration = round(len(wav) / sr, 3)
+            total_duration += duration
+
+            line = json.dumps({
+                "event": "chunk",
+                "index": i,
+                "total": total,
+                "audio_base64": encode_audio(wav, sr, fmt),
+                "sample_rate": sr,
+                "duration_seconds": duration,
+            }, ensure_ascii=False)
+            yield line + "\n"
+
+        done_line = json.dumps({
+            "event": "done",
+            "total_chunks": total,
+            "total_duration_seconds": round(total_duration, 3),
+            "sample_rate": last_sr,
+        })
+        yield done_line + "\n"
+
+    return StreamingResponse(_generate(), media_type="application/x-ndjson")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model_custom_voice, model_base_clone
@@ -147,6 +199,7 @@ class TTSRequest(BaseModel):
     language: str = Field(default="Auto", description="Language")
     instruct: Optional[str] = Field(default=None, description="Voice style instruction")
     format: str = Field(default="wav", description="Audio format: wav or mp3")
+    stream: bool = Field(default=False, description="Stream NDJSON chunks as they're generated")
 
 
 class VoiceDesignRequest(BaseModel):
@@ -154,6 +207,7 @@ class VoiceDesignRequest(BaseModel):
     instruct: str = Field(..., description="Natural language voice description")
     language: str = Field(default="Auto", description="Language")
     format: str = Field(default="wav", description="Audio format: wav or mp3")
+    stream: bool = Field(default=False, description="Stream NDJSON chunks as they're generated")
 
 
 class VoiceCloneRequest(BaseModel):
@@ -162,6 +216,7 @@ class VoiceCloneRequest(BaseModel):
     ref_text: Optional[str] = Field(default=None, description="Transcript of reference audio")
     language: str = Field(default="Auto", description="Language")
     format: str = Field(default="wav", description="Audio format: wav or mp3")
+    stream: bool = Field(default=False, description="Stream NDJSON chunks as they're generated")
 
 
 class AudioResponse(BaseModel):
@@ -207,8 +262,16 @@ async def synthesize_custom_voice(req: TTSRequest):
     if not chunks:
         raise HTTPException(400, "Empty text")
 
-    logger.info("[CustomVoice] %d chunk(s), %d chars, speaker=%s",
-                len(chunks), len(req.text), req.speaker)
+    logger.info("[CustomVoice] %d chunk(s), %d chars, speaker=%s, stream=%s",
+                len(chunks), len(req.text), req.speaker, req.stream)
+
+    if req.stream:
+        def _gen(chunk_text):
+            return model_custom_voice.generate_custom_voice(
+                text=chunk_text, speaker=req.speaker,
+                language=req.language, instruct=req.instruct,
+            )
+        return _stream_chunks_response(chunks, _gen, req.format)
 
     audio_arrays: list[np.ndarray] = []
     sample_rate = None
@@ -250,8 +313,15 @@ async def synthesize_voice_design(req: VoiceDesignRequest):
     if not chunks:
         raise HTTPException(400, "Empty text")
 
-    logger.info("[VoiceDesign] %d chunk(s), %d chars, instruct='%s...'",
-                len(chunks), len(req.text), req.instruct[:50])
+    logger.info("[VoiceDesign] %d chunk(s), %d chars, instruct='%s...', stream=%s",
+                len(chunks), len(req.text), req.instruct[:50], req.stream)
+
+    if req.stream:
+        def _gen(chunk_text):
+            return model.generate_voice_design(
+                text=chunk_text, instruct=req.instruct, language=req.language,
+            )
+        return _stream_chunks_response(chunks, _gen, req.format)
 
     audio_arrays: list[np.ndarray] = []
     sample_rate = None
@@ -295,15 +365,43 @@ async def synthesize_voice_clone(req: VoiceCloneRequest):
     except Exception:
         raise HTTPException(400, "Invalid base64 reference audio")
 
-    logger.info("[VoiceClone] %d chunk(s), %d chars, ref_text=%s",
+    logger.info("[VoiceClone] %d chunk(s), %d chars, ref_text=%s, stream=%s",
                 len(chunks), len(req.text),
-                f"'{req.ref_text[:30]}...'" if req.ref_text else "None")
+                f"'{req.ref_text[:30]}...'" if req.ref_text else "None",
+                req.stream)
 
     ref_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             f.write(ref_bytes)
             ref_path = f.name
+
+        if req.stream:
+            # Capture ref_path in closure; cleanup after generator exhausts
+            captured_ref_path = ref_path
+            ref_path = None  # Prevent finally from deleting it
+
+            def _gen(chunk_text):
+                return model_base_clone.generate_voice_clone(
+                    text=chunk_text, ref_audio=captured_ref_path,
+                    ref_text=req.ref_text, language=req.language,
+                    x_vector_only_mode=not bool(req.ref_text),
+                )
+
+            def _streaming_with_cleanup():
+                try:
+                    gen = _stream_chunks_response(chunks, _gen, req.format)
+                    yield from gen.body_iterator
+                finally:
+                    try:
+                        os.unlink(captured_ref_path)
+                    except OSError:
+                        pass
+
+            return StreamingResponse(
+                _streaming_with_cleanup(),
+                media_type="application/x-ndjson",
+            )
 
         audio_arrays: list[np.ndarray] = []
         sample_rate = None
